@@ -364,6 +364,13 @@ impl GraphShard {
                 &context.parameters,
                 self.limits.max_traversal_hops,
             )? {
+                if context.requires_snapshot_pinned_page() {
+                    // Native path pages come out of a shard-side row buffer, not
+                    // a snapshot the caller can re-enter, and the procedure is
+                    // far too expensive to run once here and again on the
+                    // caller's fallback. Decline before executing it.
+                    return Ok(QueryResultPage::new(Vec::new(), Vec::new(), None));
+                }
                 return Box::pin(
                     self.execute_native_path_rows_page(
                         context, query, procedure, cursor, page_size,
@@ -417,10 +424,35 @@ impl GraphShard {
     async fn execute_parsed_opencypher_rows_page(
         &self,
         context: QueryContext,
-        mut parsed: ParsedRowQuery,
+        parsed: ParsedRowQuery,
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<QueryResultPage> {
+        let read_epoch = self.query_read_epoch(&context).await?;
+        let storage_sequence = context.validated_storage_sequence();
+        let Some(page) = self
+            .execute_parsed_opencypher_rows_page_inner(context, parsed, cursor, page_size)
+            .await?
+        else {
+            // Declined. An unstamped page is the caller's signal to take its
+            // own path; stamping it would claim a snapshot it never pinned.
+            return Ok(QueryResultPage::new(Vec::new(), Vec::new(), None));
+        };
+        let page = page.with_read_epoch(read_epoch);
+        Ok(match storage_sequence {
+            Some(sequence) => page.with_storage_sequence(sequence),
+            None => page,
+        })
+    }
+
+    #[cfg(feature = "opencypher")]
+    async fn execute_parsed_opencypher_rows_page_inner(
+        &self,
+        context: QueryContext,
+        mut parsed: ParsedRowQuery,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<Option<QueryResultPage>> {
         let cursor_offset = cursor.map_or(0, |cursor| cursor.offset);
         let started = std::time::Instant::now();
         match self
@@ -434,7 +466,7 @@ impl GraphShard {
         {
             Ok(Some(page)) => {
                 self.record_streaming_query_rows_success(page.rows.len(), started);
-                return Ok(page);
+                return Ok(Some(page));
             }
             Ok(None) => {}
             Err(err) => {
@@ -452,7 +484,7 @@ impl GraphShard {
         {
             Ok(Some(page)) => {
                 self.record_streaming_query_rows_success(page.rows.len(), started);
-                return Ok(page);
+                return Ok(Some(page));
             }
             Ok(None) => {}
             Err(err) => {
@@ -467,7 +499,7 @@ impl GraphShard {
         {
             Ok(Some(page)) => {
                 self.record_streaming_query_rows_success(page.rows.len(), started);
-                return Ok(page);
+                return Ok(Some(page));
             }
             Ok(None) => {}
             Err(err) => {
@@ -476,6 +508,13 @@ impl GraphShard {
             }
         }
 
+        if context.requires_snapshot_pinned_page() {
+            // Everything below materialises the whole result and slices it, so
+            // the window it returns is pinned to a snapshot only for as long as
+            // this call holds one. A caller that must page across requests
+            // cannot use that, so decline instead of paying for it.
+            return Ok(None);
+        }
         let context = self.query_page_context(context, cursor_offset, page_size)?;
         parsed.window = QueryWindow::default();
         let mut result_set = Box::pin(self.execute_parsed_opencypher_rows(context, parsed)).await?;
@@ -493,11 +532,11 @@ impl GraphShard {
         } else {
             None
         };
-        Ok(QueryResultPage::new(
+        Ok(Some(QueryResultPage::new(
             result_set.columns,
             result_set.rows,
             next_cursor,
-        ))
+        )))
     }
 
     pub async fn execute_query_statement(
