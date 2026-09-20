@@ -372,7 +372,8 @@ impl QueryContext {
         self
     }
 
-    #[cfg(all(feature = "client-api", feature = "opencypher"))]
+    #[cfg(any(feature = "client-api", test))]
+    #[cfg(feature = "opencypher")]
     pub(crate) fn with_snapshot_pinned_page_only(mut self) -> Self {
         self.snapshot_pinned_page_only = true;
         self

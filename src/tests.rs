@@ -678,6 +678,83 @@ async fn cypher_single_hop_page_slices_cached_multigraph_rows_with_wal_tail() {
     writer.close().await.unwrap();
 }
 
+/// The snapshot-pinned page is refused unless the query's own `LIMIT` proves the
+/// result cannot exceed one page. Speculating instead - running a page and
+/// discarding it when a continuation turns up - would charge duplicate scan or
+/// traversal work to the caller's single runtime deadline.
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn a_snapshot_pinned_page_is_refused_unless_the_query_limit_proves_one_page() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let shard = open_test_shard("graph/pinned-page-limit-gate", object_store).await;
+    for dst in [10, 20, 30, 40] {
+        shard
+            .write_edge(typed_mutation(
+                "cell-a",
+                "CHAIN",
+                1,
+                dst,
+                &format!("pinned-gate-{dst}"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let pinned = |handle: &str| {
+        QueryContext::new("cell-a", handle).with_snapshot_pinned_page_only()
+    };
+
+    // No LIMIT: nothing proves this is one page, so the shard declines without
+    // executing and the caller keeps its own path.
+    let unbounded = Box::pin(shard.execute_cypher_rows_page(
+        pinned("pinned-gate-unbounded"),
+        "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.id ORDER BY v.id",
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert!(unbounded.rows.is_empty());
+    assert!(unbounded.next_cursor.is_none());
+    assert!(
+        unbounded.read_epoch.is_none(),
+        "a declined page must not claim a snapshot"
+    );
+
+    // A LIMIT above the page size proves nothing either.
+    let over_page = Box::pin(shard.execute_cypher_rows_page(
+        pinned("pinned-gate-over-page"),
+        "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.id ORDER BY v.id LIMIT 3",
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert!(over_page.read_epoch.is_none());
+
+    // A LIMIT at or under the page size does, so the page is served and stamped.
+    let bounded = Box::pin(shard.execute_cypher_rows_page(
+        pinned("pinned-gate-bounded"),
+        "MATCH (u {id: 1})-[:CHAIN]->(v) RETURN v.id ORDER BY v.id LIMIT 2",
+        None,
+        2,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        bounded.rows,
+        vec![
+            QueryRow::new(vec![QueryValue::VertexId(10)]),
+            QueryRow::new(vec![QueryValue::VertexId(20)]),
+        ]
+    );
+    assert!(bounded.next_cursor.is_none());
+    assert!(bounded.read_epoch.is_some());
+    assert!(bounded.storage_sequence.is_some());
+
+    shard.close().await.unwrap();
+}
+
 /// Two pages of one read do not come from one snapshot, because nothing keeps the
 /// first page's snapshot alive across calls. `execute_opencypher_rows_page` takes a
 /// fresh snapshot per call and scopes it to that call, and `snapshot_at` refuses any

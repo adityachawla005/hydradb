@@ -453,6 +453,16 @@ impl GraphShard {
         cursor: Option<QueryCursorToken>,
         page_size: usize,
     ) -> Result<Option<QueryResultPage>> {
+        if context.requires_snapshot_pinned_page()
+            && !window_fits_one_page(context.result_window, page_size)
+        {
+            // Nothing below can be handed back unless it is the whole result, and
+            // only the query's own LIMIT proves that before execution. Without it,
+            // a page that turns out to have a continuation is discarded and the
+            // caller re-runs the query - duplicate scan or traversal work under one
+            // runtime deadline. Decline instead of speculating.
+            return Ok(None);
+        }
         let cursor_offset = cursor.map_or(0, |cursor| cursor.offset);
         let started = std::time::Instant::now();
         match self
@@ -508,13 +518,6 @@ impl GraphShard {
             }
         }
 
-        if context.requires_snapshot_pinned_page() {
-            // Everything below materialises the whole result and slices it, so
-            // the window it returns is pinned to a snapshot only for as long as
-            // this call holds one. A caller that must page across requests
-            // cannot use that, so decline instead of paying for it.
-            return Ok(None);
-        }
         let context = self.query_page_context(context, cursor_offset, page_size)?;
         parsed.window = QueryWindow::default();
         let mut result_set = Box::pin(self.execute_parsed_opencypher_rows(context, parsed)).await?;
@@ -7472,6 +7475,14 @@ fn merge_opencypher_window(context: QueryContext, window: QueryWindow) -> Result
         });
     }
     Ok(context.with_result_window(window.skip, window.limit))
+}
+
+/// Whether the query's own window proves the result cannot exceed one page, which
+/// is the only thing knowable before execution. `skip` does not matter: a `LIMIT`
+/// at or under the page size bounds the rows either way.
+#[cfg(feature = "opencypher")]
+fn window_fits_one_page(window: QueryWindow, page_size: usize) -> bool {
+    window.limit.is_some_and(|limit| limit <= page_size)
 }
 
 #[cfg(feature = "opencypher")]
