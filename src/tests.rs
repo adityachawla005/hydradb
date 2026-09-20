@@ -678,6 +678,39 @@ async fn cypher_single_hop_page_slices_cached_multigraph_rows_with_wal_tail() {
     writer.close().await.unwrap();
 }
 
+/// A page encoded by a shard that predates the watermark fields still decodes, with
+/// both reading as `None`, which is what lets `read_single_engine_page` fall back
+/// during a rolling upgrade instead of failing the read outright.
+///
+/// No `#[serde(default)]` is involved. Serde routes a missing field through
+/// `missing_field`, whose deserializer answers `deserialize_option` with
+/// `visit_none`, so an absent `Option` field is `None` while an absent `bool` is an
+/// error. That is the whole reason `QueryContext::refreshed_reader` needed the
+/// attribute and the `Option` fields beside it did not.
+#[cfg(feature = "query-transport")]
+#[test]
+fn a_page_from_a_shard_without_watermarks_decodes_with_both_absent() {
+    let legacy = serde_json::json!({
+        "columns": [{"name": "value"}],
+        "rows": [{"values": [{"Count": 1}]}],
+        "next_cursor": null,
+    });
+    let page: QueryResultPage = serde_json::from_value(legacy)
+        .expect("a page without the watermark fields must still decode");
+    assert!(page.read_epoch.is_none());
+    assert!(page.storage_sequence.is_none());
+    assert_eq!(page.rows.len(), 1);
+
+    // A round trip of a stamped page keeps both, so a current shard is unaffected.
+    let stamped = QueryResultPage::new(page.columns.clone(), page.rows.clone(), None)
+        .with_read_epoch(11)
+        .with_storage_sequence(11);
+    let encoded = serde_json::to_string(&stamped).unwrap();
+    let decoded: QueryResultPage = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.read_epoch, Some(11));
+    assert_eq!(decoded.storage_sequence, Some(11));
+}
+
 /// The snapshot-pinned page is refused unless the query's own `LIMIT` proves the
 /// result cannot exceed one page. Speculating instead - running a page and
 /// discarding it when a continuation turns up - would charge duplicate scan or
